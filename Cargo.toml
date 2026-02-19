@@ -5,4 +5,4 @@ edition = "2024"
 
 [dependencies]
 clap = { version = "4.5.59", features = ["derive"] }
-macroquad = "0.4.14"
+macroquad = { path = "/home/ckrieger/srb/macroquad" }

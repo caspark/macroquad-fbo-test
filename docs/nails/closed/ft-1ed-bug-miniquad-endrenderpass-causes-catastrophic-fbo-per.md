@@ -3,6 +3,7 @@ title = "miniquad end_render_pass causes catastrophic FBO performance due to fra
 type = "bug"
 priority = "p1"
 created_at = "2026-02-19T06:29:33Z"
+resolution = "done: Fixed with two macroquad commits on master-caspark-2026-02-19 branch:"
 +++
 
 miniquad `end_render_pass()` in `src/graphics/gl.rs` unconditionally calls `glBindFramebuffer(GL_FRAMEBUFFER, self.default_framebuffer)` after every draw call, even when the next draw call will immediately rebind the same FBO. This causes the GPU to ping-pong between the FBO and default framebuffer on every single draw call when rendering to a render target.
@@ -78,3 +79,25 @@ CLI flags: `--sprites N`, `--textures N`, `--fbo`, `--duration SECS`, `--scale F
 This was discovered investigating a 24→18 FPS regression in the Signs of Danger game (wizard-pixels repo, charlie worktree). Commits `ea247b7a` and `8b9729c3` moved entity rendering from the default framebuffer to an explicit scene render target (needed for WGPU migration). The game has ~8 material/texture switches during entity rendering, creating enough draw calls to trigger this issue.
 
 The miniquad fork is at the path referenced in the wizard-pixels Cargo.toml/lock. The fix should be made there.
+
+## Resolution notes
+
+Fixed with two macroquad commits on master-caspark-2026-02-19 branch:
+
+1. 975aa6a - fix: skip MSAA resolve for non-multisampled render targets
+   Changed sample_count check from != 0 to > 1 in render_target_ex().
+   This eliminates unnecessary MSAA resolve blits (3 FPS → 60 FPS).
+
+2. 046e230 - fix: prevent double-delete of non-MSAA render target textures
+   The first fix caused render target textures to read back as empty in
+   wizard-pixels because the same GL texture was owned by both the render
+   pass (deleted by delete_render_pass) and Texture2D (garbage collected).
+   GL would reuse the freed texture ID for new textures, which would then
+   get double-deleted. Fix: use Texture2D::unmanaged() for non-MSAA render
+   targets so only delete_render_pass handles GL texture cleanup.
+
+Root cause: render_target_ex() with sample_count=1 created unnecessary
+resolve textures and did MSAA blit on every end_render_pass, causing
+O(n) GPU pipeline flushes per frame where n = number of draw call batches.
+
+No miniquad changes were needed. Both fbo-test and wizard-pixels verified working.

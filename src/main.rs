@@ -7,6 +7,10 @@ struct Args {
     #[arg(long)]
     fbo: bool,
 
+    /// Use a compositing shader (like wizard-pixels) instead of direct draw_texture_ex
+    #[arg(long)]
+    composite: bool,
+
     /// Duration to run in seconds
     #[arg(long, default_value = "4")]
     duration: f32,
@@ -34,14 +38,64 @@ fn window_conf() -> Conf {
     }
 }
 
+// Composite shader matching wizard-pixels structure: GLSL 300 es → 330, same uniform order
+const COMPOSITE_VERTEX: &str = r#"#version 330
+precision highp float;
+
+in vec3 position;
+in vec2 texcoord;
+in vec4 color0;
+
+out highp vec2 uv;
+out highp vec4 color;
+
+uniform mat4 Model;
+uniform mat4 Projection;
+
+void main() {
+    gl_Position = Projection * Model * vec4(position, 1);
+    color = color0 / 255.0;
+    uv = texcoord;
+}
+"#;
+
+const COMPOSITE_FRAGMENT: &str = r#"#version 330
+precision highp float;
+
+in vec2 uv;
+out vec4 fragColor;
+
+// Same uniform order as wizard-pixels composite.frag
+uniform sampler2D SceneTexture;
+uniform sampler2D AtomTexture;
+uniform sampler2D LightingTexture;
+uniform sampler2D BackgroundTexture;
+uniform sampler2D BloomTexture;
+uniform sampler2D TerrainSdfTexture;
+uniform sampler2D LevelRawAtomsTexture;
+uniform sampler2D LevelRawRgbasTexture;
+
+void main() {
+    // the screen texture is flipped vertically (same as wizard-pixels)
+    vec2 screenUV = uv;
+    screenUV.y = 1.0 - screenUV.y;
+
+    vec4 bg = texture(BackgroundTexture, screenUV);
+    vec4 scene = texture(SceneTexture, screenUV);
+    // Composite: background behind, scene on top
+    fragColor = vec4(mix(bg.rgb, scene.rgb, scene.a), max(bg.a, scene.a));
+}
+"#;
+
 #[macroquad::main(window_conf)]
 async fn main() {
     let args = Args::parse();
     let screen_res = vec2(screen_width(), screen_height());
 
     eprintln!(
-        "Mode: {}, sprites: {}, textures: {}, scale: {}, screen: {}x{}",
+        "Mode: {}{}, sprites: {}, textures: {}, scale: {}, screen: {}x{}",
         if args.fbo { "FBO" } else { "DEFAULT_FB" },
+        if args.composite { "+COMPOSITE" } else { "" },
         args.sprites,
         args.textures,
         args.scale,
@@ -65,8 +119,42 @@ async fn main() {
         textures.push(tex);
     }
 
+    // Two render targets, like wizard-pixels' background_render_target and scene_render_target
+    let background_rt = render_target(screen_res.x as u32, screen_res.y as u32);
+    background_rt.texture.set_filter(FilterMode::Nearest);
     let scene_rt = render_target(screen_res.x as u32, screen_res.y as u32);
     scene_rt.texture.set_filter(FilterMode::Nearest);
+
+    // Create compositing material (like wizard-pixels)
+    let composite_material = if args.composite {
+        Some(
+            load_material(
+                ShaderSource::Glsl {
+                    vertex: COMPOSITE_VERTEX,
+                    fragment: COMPOSITE_FRAGMENT,
+                },
+                MaterialParams {
+                    textures: vec![
+                        "BackgroundTexture".to_string(),
+                        "AtomTexture".to_string(),
+                        "LightingTexture".to_string(),
+                        "BloomTexture".to_string(),
+                        "TerrainSdfTexture".to_string(),
+                        "LevelRawAtomsTexture".to_string(),
+                        "LevelRawRgbasTexture".to_string(),
+                        "SceneTexture".to_string(),
+                    ],
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        )
+    } else {
+        None
+    };
+
+    // Create dummy textures for unused slots
+    let dummy_tex = Texture2D::from_image(&Image::gen_image_color(1, 1, BLACK));
 
     let start_time = get_time();
     let mut frame_count = 0u64;
@@ -107,24 +195,150 @@ async fn main() {
         if args.fbo {
             clear_background(Color::new(0.0, 0.0, 0.0, 0.0));
 
-            push_camera_state();
-            let scene_cam = Camera2D {
-                target: game_camera.target,
-                zoom: vec2(game_camera.zoom.x, -game_camera.zoom.y),
-                render_target: Some(scene_rt.clone()),
+            // === STEP 1: Draw background to background_rt ===
+            // (like wizard-pixels draws background gradient to background_render_target)
+            {
+                push_camera_state();
+                let bg_cam = Camera2D {
+                    target: game_camera.target,
+                    zoom: vec2(game_camera.zoom.x, -game_camera.zoom.y),
+                    render_target: Some(background_rt.clone()),
+                    ..Default::default()
+                };
+                set_camera(&bg_cam);
+                clear_background(Color::new(0.0, 0.0, 0.0, 0.0));
+
+                // Draw a gradient background
+                let half_w = world_visible.x / 2.0;
+                let half_h = world_visible.y / 2.0;
+                for i in 0..20 {
+                    let t = i as f32 / 19.0;
+                    let y = -half_h + t * world_visible.y;
+                    let color = Color::new(0.3 * (1.0 - t), 0.1, 0.3 * t + 0.2, 1.0);
+                    draw_rectangle(-half_w, y, world_visible.x, world_visible.y / 20.0, color);
+                }
+
+                pop_camera_state();
+            }
+
+            // === STEP 2: Draw sprites to scene_rt ===
+            // (like wizard-pixels draws entities to scene_render_target)
+            {
+                push_camera_state();
+                let scene_cam = Camera2D {
+                    target: game_camera.target,
+                    zoom: vec2(game_camera.zoom.x, -game_camera.zoom.y),
+                    render_target: Some(scene_rt.clone()),
+                    ..Default::default()
+                };
+                set_camera(&scene_cam);
+                clear_background(Color::new(0.0, 0.0, 0.0, 0.0));
+
+                draw_sprites(&textures, args.sprites, elapsed as f32, world_visible);
+
+                pop_camera_state();
+            }
+
+            // === STEP 3: Composite ===
+            set_camera(&Camera2D {
+                zoom: vec2(1.0 / screen_res.x * 2.0, 1.0 / screen_res.y * 2.0),
+                target: vec2(screen_res.x / 2.0, screen_res.y / 2.0),
                 ..Default::default()
-            };
-            set_camera(&scene_cam);
-            clear_background(Color::new(0.0, 0.0, 0.0, 0.0));
+            });
 
-            draw_sprites(&textures, args.sprites, elapsed as f32, world_visible);
-
-            pop_camera_state();
+            if let Some(ref mat) = composite_material {
+                // Set textures like wizard-pixels
+                mat.set_texture("BackgroundTexture", background_rt.texture.weak_clone());
+                mat.set_texture("AtomTexture", dummy_tex.clone());
+                mat.set_texture("LightingTexture", dummy_tex.clone());
+                mat.set_texture("BloomTexture", dummy_tex.clone());
+                mat.set_texture("TerrainSdfTexture", dummy_tex.clone());
+                mat.set_texture("LevelRawAtomsTexture", dummy_tex.clone());
+                mat.set_texture("LevelRawRgbasTexture", dummy_tex.clone());
+                mat.set_texture("SceneTexture", scene_rt.texture.weak_clone());
+                gl_use_material(&mat);
+                draw_texture_ex(
+                    &dummy_tex,
+                    0.0,
+                    0.0,
+                    WHITE,
+                    DrawTextureParams {
+                        dest_size: Some(vec2(screen_res.x, screen_res.y)),
+                        ..Default::default()
+                    },
+                );
+                gl_use_default_material();
+            } else {
+                // Direct blit: draw background then scene
+                draw_texture_ex(
+                    &background_rt.texture,
+                    0.0,
+                    0.0,
+                    WHITE,
+                    DrawTextureParams {
+                        dest_size: Some(vec2(screen_res.x, screen_res.y)),
+                        ..Default::default()
+                    },
+                );
+                draw_texture_ex(
+                    &scene_rt.texture,
+                    0.0,
+                    0.0,
+                    WHITE,
+                    DrawTextureParams {
+                        dest_size: Some(vec2(screen_res.x, screen_res.y)),
+                        ..Default::default()
+                    },
+                );
+            }
         } else {
             clear_background(Color::new(0.0, 0.0, 0.0, 0.0));
             set_camera(&game_camera);
 
             draw_sprites(&textures, args.sprites, elapsed as f32, world_visible);
+        }
+
+        if frame_count == 10 {
+            // Read back screen pixels to verify sprites are visible
+            let img = get_screen_data();
+            let mut nonzero = 0u32;
+            for y in 0..img.height() {
+                for x in 0..img.width() {
+                    let px = img.get_pixel(x as u32, y as u32);
+                    if px.r > 0.01 || px.g > 0.01 || px.b > 0.01 {
+                        nonzero += 1;
+                    }
+                }
+            }
+            eprintln!("[VERIFY] Screen pixels with content: {} / {} ({}x{})",
+                nonzero, img.width() * img.height(), img.width(), img.height());
+            if args.fbo {
+                let rt_img = scene_rt.texture.get_texture_data();
+                let mut rt_nonzero = 0u32;
+                for y in 0..rt_img.height() {
+                    for x in 0..rt_img.width() {
+                        let px = rt_img.get_pixel(x as u32, y as u32);
+                        if px.a > 0.01 {
+                            rt_nonzero += 1;
+                        }
+                    }
+                }
+                eprintln!("[VERIFY] scene_rt texture non-transparent: {} / {}",
+                    rt_nonzero, rt_img.width() * rt_img.height());
+
+                let bg_img = background_rt.texture.get_texture_data();
+                let mut bg_nonzero = 0u32;
+                for y in 0..bg_img.height() {
+                    for x in 0..bg_img.width() {
+                        let px = bg_img.get_pixel(x as u32, y as u32);
+                        if px.a > 0.01 {
+                            bg_nonzero += 1;
+                        }
+                    }
+                }
+                eprintln!("[VERIFY] bg_rt texture non-transparent: {} / {}",
+                    bg_nonzero, bg_img.width() * bg_img.height());
+            }
         }
 
         next_frame().await;
@@ -140,7 +354,10 @@ async fn main() {
     let p95 = sorted_times[(sorted_times.len() as f64 * 0.95) as usize];
     let p99 = sorted_times[(sorted_times.len() as f64 * 0.99) as usize];
 
-    eprintln!("\n=== RESULTS ({}) ===", if args.fbo { "FBO" } else { "DEFAULT_FB" });
+    eprintln!("\n=== RESULTS ({}{}) ===",
+        if args.fbo { "FBO" } else { "DEFAULT_FB" },
+        if args.composite { "+COMPOSITE" } else { "" }
+    );
     eprintln!("Total frames: {}", frame_count);
     eprintln!("Avg FPS: {:.1}", avg_fps);
     eprintln!("Frame time P50: {:.2}ms", p50 * 1000.0);
@@ -159,7 +376,6 @@ fn draw_sprites(textures: &[Texture2D], count: usize, time: f32, world_visible: 
         let x = angle.cos() * radius;
         let y = angle.sin() * radius;
 
-        // Cycle through textures to break batching
         let tex_idx = i % textures.len();
         let size = 8.0 + (fi * 0.1).sin() * 4.0;
 
