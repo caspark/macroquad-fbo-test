@@ -5,4 +5,10 @@ edition = "2024"
 
 [dependencies]
 clap = { version = "4.5.59", features = ["derive"] }
-macroquad = { path = "/home/ckrieger/srb/macroquad" }
+macroquad = "0.4.14"
+
+# Uncomment the patch section below to use the fixed macroquad/miniquad fork
+# which resolves the FBO render target performance issue.
+# [patch.crates-io]
+# macroquad = { git = "https://github.com/caspark/macroquad.git", branch = "master-caspark-2026-02-19" }
+# miniquad = { git = "https://github.com/caspark/miniquad.git", branch = "master-caspark-2026-02-19" }
