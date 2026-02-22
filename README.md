@@ -1,6 +1,12 @@
+> **Caveat Emptor:** genAI coding agents involved here:
+> 
+> * Repo code almost entirely vibe coded (asked agent to extract minimal example that repros the slowdown from my game, [Signs of Danger](https://www.slowrush.dev/))
+> * Readme you are reading was AI-written then lightly edited by a human for clarity and (some) conciseness.
+> * Fixes to miniquad and macroquad were human-in-the-loop with me sanity checking the reasoning but of course it's easy to be led astray by your coding agents' enthusiasm. I can say these patches fixed the perf regression I was seeing in my game, but always possible I've broken something else that I'm not using in my game via some spooky-action-at-a-distance type of thing.
+
 # macroquad-fbo-test
 
-A benchmark for comparing rendering performance in [macroquad](https://github.com/not-fl3/macroquad) when drawing sprites directly to the default framebuffer vs. rendering through intermediate FBOs (framebuffer objects / render targets) with optional compositing.
+A benchmark for comparing rendering performance in [macroquad](https://github.com/not-fl3/macroquad) when drawing sprites directly to the default framebuffer vs. rendering through intermediate FBOs (framebuffer objects / render targets) with optional compositing, used as part of figuring out https://github.com/not-fl3/macroquad/issues/1020
 
 This was created to investigate an FBO-related performance regression where rendering through render targets was significantly slower than drawing directly to the screen.
 
